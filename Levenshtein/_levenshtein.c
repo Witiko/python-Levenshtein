@@ -110,6 +110,7 @@
 #define PyInt_AS_LONG PyLong_AsLong
 #define PyInt_FromLong PyLong_FromLong
 #define PyInt_Check PyLong_Check
+#define PyInt_Type PyLong_Type
 #define PY_INIT_MOD(module, name, doc, methods) \
         static struct PyModuleDef moduledef = { \
             PyModuleDef_HEAD_INIT, name, doc, -1, methods, }; \
@@ -164,6 +165,8 @@ static void
 taus113_set(taus113_state_t *state,
             unsigned long int s);
 
+#define max(x, y) ((x) > (y) ? (x) : (y))
+
 #ifndef NO_PYTHON
 /* python interface and wrappers */
 /* declarations and docstrings {{{ */
@@ -203,7 +206,7 @@ static PyObject* subtract_edit_py(PyObject *self, PyObject *args);
 #define distance_DESC \
   "Compute absolute Levenshtein distance of two strings.\n" \
   "\n" \
-  "distance(string1, string2)\n" \
+  "distance(string1, string2, max_distance=max(len(string1, string2)))\n" \
   "\n" \
   "Examples (it's hard to spell Levenshtein correctly):\n" \
   "\n" \
@@ -216,7 +219,21 @@ static PyObject* subtract_edit_py(PyObject *self, PyObject *args);
   ">>> distance('Levenshtein', 'Levenshtein')\n" \
   "0\n" \
   "\n" \
-  "Yeah, we've managed it at last.\n"
+  "Yeah, we've managed it at last.\n" \
+  "\n" \
+  "If we don't care about distances larger than a known threshold, a more\n" \
+  "efficient code path can be taken. For terms that are clearly \"too far\"\n" \
+  "apart, we will not compute the distance exactly, but we will return\n" \
+  "max(len(string1), len(string2)) instead:\n" \
+  "\n" \
+  ">>> distance('Levenshtein', 'Lenvinsten', 1)\n" \
+  "11\n" \
+  ">>> distance('Levenshtein', 'Levensthein', 1)\n" \
+  "11\n" \
+  ">>> distance('Levenshtein', 'Levenshten', 1)\n" \
+  "1\n" \
+  ">>> distance('Levenshtein', 'Levenshtein', 1)\n" \
+  "0\n"
 
 #define ratio_DESC \
   "Compute similarity of two strings.\n" \
@@ -696,10 +713,23 @@ levenshtein_common(PyObject *args, const char *name, size_t xcost,
                    size_t *lensum)
 {
   PyObject *arg1, *arg2;
-  size_t len1, len2;
+  PyObject *arg3 = (PyObject*) 0;
+  size_t len1, len2, max_distance;
 
-  if (!PyArg_UnpackTuple(args, PYARGCFIX(name), 2, 2, &arg1, &arg2))
+  if (!PyArg_UnpackTuple(args, PYARGCFIX(name), 2, 3, &arg1, &arg2, &arg3))
     return -1;
+
+  if (arg3) {
+    if (PyObject_TypeCheck(arg3, &PyInt_Type))
+      max_distance = (size_t)PyInt_AS_LONG(arg3);
+    else if (PyObject_TypeCheck(arg3, &PyLong_Type))
+      max_distance = (size_t)PyLong_AsLong(arg3);
+    else {
+      PyErr_Format(PyExc_TypeError,
+                   "%s expected the third parameter to be a Long", name);
+      return -1;
+    }
+  }
 
   if (PyObject_TypeCheck(arg1, &PyString_Type)
       && PyObject_TypeCheck(arg2, &PyString_Type)) {
@@ -708,14 +738,19 @@ levenshtein_common(PyObject *args, const char *name, size_t xcost,
     len1 = PyString_GET_SIZE(arg1);
     len2 = PyString_GET_SIZE(arg2);
     *lensum = len1 + len2;
+    if (arg3 == NULL)
+      max_distance = max(len1, len2);
     string1 = PyString_AS_STRING(arg1);
     string2 = PyString_AS_STRING(arg2);
     {
-      size_t d = lev_edit_distance(len1, string1, len2, string2, xcost);
+      size_t d = lev_approx_edit_distance(len1, string1, len2, string2,
+                                          xcost, max_distance);
       if (d == (size_t)(-1)) {
         PyErr_NoMemory();
         return -1;
       }
+      if (d > max_distance)
+        return max(len1, len2);
       return d;
     }
   }
@@ -726,14 +761,19 @@ levenshtein_common(PyObject *args, const char *name, size_t xcost,
     len1 = PyUnicode_GET_SIZE(arg1);
     len2 = PyUnicode_GET_SIZE(arg2);
     *lensum = len1 + len2;
+    if (arg3 == NULL)
+      max_distance = max(len1, len2);
     string1 = PyUnicode_AS_UNICODE(arg1);
     string2 = PyUnicode_AS_UNICODE(arg2);
     {
-      size_t d = lev_u_edit_distance(len1, string1, len2, string2, xcost);
+      size_t d = lev_u_approx_edit_distance(len1, string1, len2, string2,
+                                            xcost, max_distance);
       if (d == (size_t)(-1)) {
         PyErr_NoMemory();
         return -1;
       }
+      if (d > max_distance)
+        return max(len1, len2);
       return d;
     }
   }
@@ -2229,6 +2269,31 @@ lev_edit_distance(size_t len1, const lev_byte *string1,
                   size_t len2, const lev_byte *string2,
                   int xcost)
 {
+  return lev_approx_edit_distance(len1, string1, len2, string2, xcost,
+                                  max(len1, len2));
+}
+
+
+/**
+ * lev_approx_edit_distance:
+ * @len1: The length of @string1.
+ * @string1: A sequence of bytes of length @len1, may contain NUL characters.
+ * @len2: The length of @string2.
+ * @string2: A sequence of bytes of length @len2, may contain NUL characters.
+ * @xcost: If nonzero, the replace operation has weight 2, otherwise all
+ *         edit operations have equal weights of 1.
+ * @max_distance: The maximum Levenshtein distance after which we return
+ *                max(len1, len2) and exit prematurely.
+ *
+ * Computes Levenshtein edit distance of two strings.
+ *
+ * Returns: The edit distance.
+ **/
+_LEV_STATIC_PY size_t
+lev_approx_edit_distance(size_t len1, const lev_byte *string1,
+                         size_t len2, const lev_byte *string2,
+                         int xcost, size_t max_distance)
+{
   size_t i;
   size_t *row;  /* we only need to keep one row of costs */
   size_t *end;
@@ -2263,6 +2328,11 @@ lev_edit_distance(size_t len1, const lev_byte *string1,
     string1 = string2;
     string2 = sx;
   }
+
+  /* catch additional trivial cases */
+  if (len2 - len1 > max_distance)
+    return len2;
+
   /* check len1 == 1 separately */
   if (len1 == 1) {
     if (xcost)
@@ -2406,6 +2476,32 @@ lev_u_edit_distance(size_t len1, const lev_wchar *string1,
                     size_t len2, const lev_wchar *string2,
                     int xcost)
 {
+  return lev_u_approx_edit_distance(len1, string1, len2, string2, xcost,
+                                    max(len1, len2));
+}
+
+/**
+ * lev_u_edit_distance:
+ * @len1: The length of @string1.
+ * @string1: A sequence of Unicode characters of length @len1, may contain NUL
+ *           characters.
+ * @len2: The length of @string2.
+ * @string2: A sequence of Unicode characters of length @len2, may contain NUL
+ *           characters.
+ * @xcost: If nonzero, the replace operation has weight 2, otherwise all
+ *         edit operations have equal weights of 1.
+ * @max_distance: The maximum Levenshtein distance after which we return
+ *                max(len1, len2) and exit prematurely.
+ *
+ * Computes Levenshtein edit distance of two Unicode strings.
+ *
+ * Returns: The edit distance.
+ **/
+_LEV_STATIC_PY size_t
+lev_u_approx_edit_distance(size_t len1, const lev_wchar *string1,
+                           size_t len2, const lev_wchar *string2,
+                           int xcost, size_t max_distance)
+{
   size_t i;
   size_t *row;  /* we only need to keep one row of costs */
   size_t *end;
@@ -2440,6 +2536,11 @@ lev_u_edit_distance(size_t len1, const lev_wchar *string1,
     string1 = string2;
     string2 = sx;
   }
+
+  /* catch additional trivial cases */
+  if (len2 - len1 > max_distance)
+    return len2;
+
   /* check len1 == 1 separately */
   if (len1 == 1) {
     lev_wchar z = *string1;
